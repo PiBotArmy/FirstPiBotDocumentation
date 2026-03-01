@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+import tempfile
+import subprocess
+import sounddevice as sd
+import soundfile as sf
+import numpy as np
+from openai import OpenAI
+
+# ============================
+# Configuration
+# ============================
+SAMPLE_RATE = 16000
+VOICE = "sage"
+
+# Balanced memory optimization
+MAX_MESSAGES = 12   # trigger summarization when conversation exceeds this
+KEEP_LAST = 5       # keep this many most-recent (non-system) messages verbatim
+
+client = OpenAI()  # uses OPENAI_API_KEY from environment
+
+
+# ============================
+# Recording (ENTER-based push-to-talk)
+# ============================
+def record_until_enter():
+    print("\n🎤 Press ENTER to start recording")
+    input()
+
+    print("🎙️ Recording... press ENTER to stop")
+    audio_frames = []
+
+    def callback(indata, frames, time, status):
+        audio_frames.append(indata.copy())
+
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        callback=callback,
+        dtype="int16"
+    ):
+        input()  # wait for ENTER to stop
+
+    print("✅ Recording stopped")
+
+    if not audio_frames:
+        return np.array([], dtype=np.int16)
+
+    return np.concatenate(audio_frames, axis=0)
+
+
+# ============================
+# Speech-to-text
+# ============================
+def transcribe_audio(filename: str) -> str:
+    with open(filename, "rb") as f:
+        result = client.audio.transcriptions.create(
+            file=f,
+            model="gpt-4o-mini-transcribe"
+        )
+    return (result.text or "").strip()
+
+
+# ============================
+# LLM response
+# ============================
+def generate_response(conversation) -> str:
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=conversation
+    )
+    return (completion.choices[0].message.content or "").strip()
+
+
+# ============================
+# Summarization (memory optimization)
+# ============================
+def summarize_conversation(messages) -> str:
+    summary_prompt = [
+        {
+            "role": "system",
+            "content": (
+                "Summarize the following conversation. Preserve important facts, "
+                "preferences, decisions, and context. Be concise. Do not include "
+                "dialogue formatting."
+            )
+        },
+        {
+            "role": "user",
+            "content": "\n".join(
+                f"{m['role'].upper()}: {m['content']}"
+                for m in messages
+            )
+        }
+    ]
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=summary_prompt
+    )
+
+    return (response.choices[0].message.content or "").strip()
+
+
+# ============================
+# Text-to-speech + playback
+# ============================
+def speak(text: str):
+    response = client.audio.speech.create(
+        model="gpt-4o-mini-tts",
+        voice=VOICE,
+        input=text
+    )
+
+    # Playback uses ffplay (works well with PipeWire + Bluetooth).
+    # Pad audio slightly to avoid clipping the first syllable on device start.
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=True) as tmp:
+        tmp.write(response.read())
+        tmp.flush()
+
+        subprocess.run(
+            [
+                "ffplay",
+                "-nodisp",
+                "-autoexit",
+                "-loglevel", "quiet",
+                "-af", "apad=pad_dur=0.3",
+                tmp.name
+            ],
+            check=True
+        )
+
+
+# ============================
+# Main loop
+# ============================
+def main():
+    conversation = [
+        {
+            "role": "system",
+            "content": (
+                "You are a helpful, concise talking robot. Respond in English. "
+                "Remember the conversation for the entire session."
+            )
+        }
+    ]
+
+    print("🤖 Push-to-Talk Robot (ENTER based)")
+    print("Press ENTER to start / stop recording")
+    print("Ctrl+C to exit")
+
+    try:
+        while True:
+            audio = record_until_enter()
+
+            # Guard: ignore empty/near-empty recordings (prevents STT 400 errors)
+            if audio.size < int(SAMPLE_RATE * 0.2):  # < ~200ms
+                print("⚠️ No speech detected, try again.")
+                continue
+
+            with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
+                sf.write(tmp.name, audio, SAMPLE_RATE)
+                user_text = transcribe_audio(tmp.name)
+
+            if not user_text:
+                print("⚠️ Transcription empty, try again.")
+                continue
+
+            print(f"\n🧠 Heard: {user_text}")
+            conversation.append({"role": "user", "content": user_text})
+
+            reply = generate_response(conversation)
+            print(f"\n🤖 Robot says: {reply}")
+            conversation.append({"role": "assistant", "content": reply})
+
+            # Balanced memory optimization: summarize older dialogue
+            if len(conversation) > MAX_MESSAGES:
+                print("🧠 Summarizing older conversation...")
+
+                system_messages = [m for m in conversation if m["role"] == "system"]
+                dialogue = [m for m in conversation if m["role"] != "system"]
+
+                old_messages = dialogue[:-KEEP_LAST]
+                recent_messages = dialogue[-KEEP_LAST:]
+
+                summary_text = summarize_conversation(old_messages)
+
+                conversation = system_messages + [
+                    {"role": "system", "content": f"Conversation summary: {summary_text}"}
+                ] + recent_messages
+
+            speak(reply)
+
+    except KeyboardInterrupt:
+        print("\n👋 Shutting down")
+
+
+if __name__ == "__main__":
+    main()
